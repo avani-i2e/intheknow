@@ -7,6 +7,7 @@
 
 import json
 import requests
+import time
 import boto3
 import os
 import xml.etree.ElementTree as ET
@@ -39,29 +40,26 @@ client = OpenAI(
 )
  
 PUBMED_EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
- 
+MAX_RETRIES = 5
+def fetch_with_retries(url, params, headers=None):
+    """Handles 429 errors with exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code == 429:
+            wait_time = 2 ** attempt  # Exponential backoff
+            time.sleep(wait_time)
+        else:
+            response.raise_for_status()
+            return response
+    return None
 # Function to fetch publication details from OpenSearch
 def fetch_opensearch_publication_details():
-    query = {
-        "query": {
-            "match_all": {}
-        }
-    }
-    # Fetch the publications ( authors)
-    response = opensearch.search(index="pubmed_articles", body=query)
-    publications = response['hits']['hits']
-   
-    publication_details = []
-    for pub in publications:
-        publication = pub['_source']
-        authors = publication.get('authors', [])
-        publication_details.append({
-            "authors": authors
-        })
-   
-    return publication_details
+    query = {"query": {"match_all": {}}}
+    response = opensearch.search(index="articles_index", body=query)
+    return [{"authors": pub['_source'].get('authors', [])} for pub in response['hits']['hits']]
  
 # Function to fetch KOL data from PubMed
+ 
 def fetch_pubmed_affiliation_and_collaborators_and_research(kol_name):
     try:
         esearch_url = f"{PUBMED_EUTILS_BASE}esearch.fcgi"
@@ -71,7 +69,9 @@ def fetch_pubmed_affiliation_and_collaborators_and_research(kol_name):
             "retmode": "json",
             "retmax": "10"  # Limit the number of articles to fetch
         }
-        esearch_response = requests.get(esearch_url, params=esearch_params)
+        esearch_response = fetch_with_retries(esearch_url, esearch_params)
+        if not esearch_response:
+            return {"error": "PubMed request failed"}
         esearch_response.raise_for_status()
         esearch_data = esearch_response.json()
  
@@ -91,7 +91,7 @@ def fetch_pubmed_affiliation_and_collaborators_and_research(kol_name):
             "retmode": "xml",
             "rettype": "xml"
         }
-        efetch_response = requests.get(efetch_url, params=efetch_params)
+        efetch_response = fetch_with_retries(efetch_url, efetch_params)
         efetch_response.raise_for_status()
  
         root = ET.fromstring(efetch_response.text)
@@ -119,7 +119,7 @@ def fetch_pubmed_affiliation_and_collaborators_and_research(kol_name):
                 if affiliation is not None:
                     geographic_influence.append(affiliation.text.strip())
  
-        # Research articles (titles and publication years)
+        #research articles (titles and publication years)
         articles = root.findall(".//PubmedArticle")
         for article in articles:
             title_element = article.find(".//ArticleTitle")
@@ -142,7 +142,6 @@ def fetch_pubmed_affiliation_and_collaborators_and_research(kol_name):
             "geographic_influence": [],
             "research": []
         }
- 
 # Function to fetch AI-generated metadata for KOLs
 def fetch_ai_metadata(kol_name, primary_affiliation, geographic_influence, collaborators):
     prompt = f'''You are a data extraction assistant and also think as backend developer. Generate and retrieve this metadata for the Key Opinion Leader (KOL) of medical science "Dr. {kol_name}" with the following details:
@@ -174,9 +173,9 @@ def fetch_ai_metadata(kol_name, primary_affiliation, geographic_influence, colla
     }}
     Guidelines:
     1. Use verified sources (institutional websites, PubMed, Google Scholar, ClinicalTrials.gov,wikipedia).
-    2. Use "Not found" for missing fields.
+    2. Use "Not available" for missing fields.
     4. Follow strict JSON format.
-    5. Escape special characters.
+    5. Escape special characters and social media links should be valid.
     '''
     try:
         response = client.chat.completions.create(
