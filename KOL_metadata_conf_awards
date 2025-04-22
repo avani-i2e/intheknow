@@ -1,0 +1,722 @@
+import json
+import requests
+from typing import List, Dict
+import re
+import time
+import boto3
+import os
+import xml.etree.ElementTree as ET
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
+from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+ 
+# AWS Credentials & OpenSearch Config
+region = "us-east-1"
+service = "es"
+opensearch_host = os.environ['OPENSEARCH_HOST']
+credentials = boto3.Session().get_credentials()
+awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
+ 
+# # OpenSearch Client
+opensearch = OpenSearch(
+    hosts=[{'host': opensearch_host, 'port': 443}],
+    http_auth=awsauth,
+    use_ssl=True,
+    verify_certs=True,
+    connection_class=RequestsHttpConnection,
+    timeout=30
+)
+# OpenAI API Key (For ChatGPT)
+client = OpenAI(
+    base_url="https://models.inference.ai.azure.com",
+    api_key="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",
+)
+def fetch_kol_search_url(kol_name):
+    """
+    Fetch the first search result URL for a KOL using SerpAPI.
+   
+    Args:
+        kol_name (str): Name of the Key Opinion Leader
+       
+    Returns:
+        str: First search result URL or "Not Available" if none found
+    """
+    # Replace with your SerpAPI key (get it from https://serpapi.com/)
+    serpapi_key = "cc38c1fe6b33fb4b35df7914f55dde823663f8f56abe7a236663fd1f8fb6c59d"
+   
+    try:
+        # Construct search query
+        search_query = f"{kol_name} MD"
+        params = {
+            "q": search_query,
+            "engine": "google",
+            "api_key": serpapi_key,
+            "num": 1  # Limit to 1 result
+        }
+       
+        # Make the API request
+        search_url = "https://serpapi.com/search"
+        response = requests.get(search_url, params=params).json()
+       
+        # Extract the first search result URL
+        organic_results = response.get("organic_results", [])
+        if not organic_results:
+            print(f"No search results found for {kol_name}")
+            return "Not Available"
+        else:
+            result_url = organic_results[0].get("link", "Not Available")
+            return result_url
+           
+    except Exception as e:
+        print(f"Error fetching URL for {kol_name}: {str(e)}")
+        return "Not Available"
+def fetch_kol_images(kol_name):
+    """
+    Fetch official profile images for a list of KOLs using SerpAPI.
+    """
+    # Replace with your SerpAPI key (get it from https://serpapi.com/)
+    serpapi_key = "cecdfdeef3eb08b0470a2fd0438e5854017219c0787ed513054627c31a8112e4"
+    results = {}
+ 
+    try:
+       
+        search_query = f"{kol_name} MD profile"
+        params = {
+                "q": search_query,
+                "engine": "google",
+                "tbm": "isch",  # Image search
+                "api_key": serpapi_key,
+                "num": 1  # Limit to 1 result
+            }
+ 
+        search_url = "https://serpapi.com/search"
+        response = requests.get(search_url, params=params).json()
+           
+            # Extract image URL from SerpAPI response
+        images = response.get("images_results", [])
+        if not images:
+            print(f"No image found for {kol_name}")
+            results[kol_name] = "Not Available"
+        else:
+            image_url = images[0].get("original", "Not Available")
+               
+               
+            results[kol_name] = image_url
+ 
+    except Exception as e:
+        print(f"Error fetching image URL for {kol_name}: {str(e)}")
+        results[kol_name] = "Not Available"
+    return results
+# Function to fetch research details from PubMed
+def clean_affiliation(affiliation: str) -> str:
+    """Remove emails, phone numbers, and extraneous details from affiliation."""
+    if not affiliation:
+        return "N/A"
+    # Remove emails, "Electronic address", and phone numbers (e.g., "1 5166001421", "+1-123-456-7890")
+    cleaned = re.sub(r'(\S+@\S+\.\S+|Electronic address:\s*\S+|\+?\d[\d\s-]{7,})', '', affiliation).strip()
+    # Remove trailing period and normalize spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).rstrip('.')
+    return cleaned
+ 
+def parse_location_from_affiliation(affiliation: str) -> str:
+    """Parse location (state/province, country or state or country) from affiliation."""
+    if not affiliation or affiliation.lower() == "n/a":
+        return "N/A"
+   
+    # Clean the affiliation
+    cleaned_aff = clean_affiliation(affiliation)
+    # Split by commas, filter out empty or numeric parts (postal codes)
+    parts = [part.strip() for part in cleaned_aff.split(',') if part.strip() and not part.strip().isdigit()]
+    if not parts:
+        return "N/A"
+   
+    # Work backward to identify state/province and country
+    if len(parts) >= 2:
+        last_part = parts[-1].strip()
+        second_last = parts[-2].strip()
+        # Check if second-to-last looks like a state/province (short code or single word)
+        if (len(second_last) <= 3 and second_last.isalpha()) or (len(second_last.split()) == 1 and second_last.lower() not in {'university', 'hospital', 'institute', 'research', 'health', 'drive', 'suite'}):
+            return f"{second_last}, {last_part}"
+        # If no clear state/province, use the last part (country)
+        return last_part
+    # Only one part: could be state or country
+    return parts[-1].strip()
+ 
+def fetch_pubmed_details(pubmed_ids: List[str], target_author: str) -> Dict[str, any]:
+    """
+    Fetch research details from PubMed and extract affiliations for target author and co-authors.
+    Excludes the target author (main KOL) from collaborators.
+ 
+    Args:
+        pubmed_ids (list): List of PubMed IDs to fetch
+        target_author (str): Full name of target author (First Middle Last or First Last)
+ 
+    Returns:
+        dict: Dictionary containing research details, collaborators (excluding target author),
+              primary affiliation, geographical influence (co-authors' details), country, and state/province
+    """
+    if not pubmed_ids:
+        return {
+            "research": [],
+            "collaborators": [],
+            "primary_affiliation": "N/A",
+            "geographical_influence": [],
+            "country": "N/A",
+            "state_province": "N/A"
+        }
+ 
+    # Normalize target author name for matching
+    target_author_normalized = target_author.lower().replace(" ", "")
+   
+    research_list = []
+    all_collaborators = set()  # Only for co-authors, not target author
+    primary_affiliation = "N/A"
+    country = "N/A"
+    state_province = "N/A"
+    geographical_influence = []
+    seen_authors = set()  # For deduplication in geographical_influence
+   
+    # Hardcoded U.S. state lookup dictionary (name: abbreviation)
+    us_states = {
+        "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+        "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA",
+        "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+        "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+        "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+        "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV", "new hampshire": "NH",
+        "new jersey": "NJ", "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+        "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA",
+        "rhode island": "RI", "south carolina": "SC", "south dakota": "SD", "tennessee": "TN",
+        "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+        "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY"
+    }
+    us_states_full = {state.lower(): abbr for state, abbr in us_states.items()}
+    us_states_abbr = {abbr.lower(): abbr for abbr in us_states.values()}
+   
+    for pubmed_id in pubmed_ids:
+        url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pubmed_id}"
+       
+        try:
+            time.sleep(0.5)
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+           
+            if response.status_code != 200:
+                print(f"Failed to fetch data for PubMed ID {pubmed_id}: Status code {response.status_code}")
+                continue
+           
+            root = ET.fromstring(response.text)
+           
+            # Extract Title and Year for research
+            title_element = root.find(".//ArticleTitle")
+            title = title_element.text if title_element is not None else "N/A"
+            year_element = root.find(".//PubDate/Year")
+            year = year_element.text if year_element is not None else "N/A"
+            if title != "N/A":
+                research_list.append(f"{title} --{year}")
+           
+            # Extract Authors and Affiliations
+            author_list = root.findall(".//Author")
+            for author in author_list:
+                last_name = author.find("LastName")
+                fore_name = author.find("ForeName")
+               
+                if last_name is None or fore_name is None:
+                    full_name = "N/A"
+                else:
+                    full_name = f"{fore_name.text} {last_name.text}"
+                    xml_name_normalized = (fore_name.text.lower() + last_name.text.lower()).replace(" ", "")
+               
+                is_target_author = xml_name_normalized == target_author_normalized
+               
+                # Only add to collaborators if NOT the target author
+                if not is_target_author and full_name != "N/A":
+                    all_collaborators.add(full_name)
+               
+                affiliation_elements = author.findall(".//Affiliation")
+                author_affiliations = [aff.text for aff in affiliation_elements if aff.text]
+               
+                # Set primary_affiliation, country, and state/province for target author
+                if primary_affiliation == "N/A" and is_target_author and author_affiliations:
+                    primary_affiliation = author_affiliations[0]
+                    aff_cleaned = clean_affiliation(primary_affiliation)
+                    location = parse_location_from_affiliation(aff_cleaned)
+                    loc_parts = [part.strip().lower() for part in location.split(",") if part.strip()]
+                   
+                    if len(loc_parts) == 2:
+                        second_last_part, last_part = loc_parts
+                        if last_part in us_states_abbr:
+                            state_province = us_states_abbr[last_part]
+                            country = "US"
+                        elif last_part in us_states_full:
+                            state_province = us_states_full[last_part]
+                            country = "US"
+                        elif last_part in {"usa", "united states"}:
+                            country = "US"
+                            if second_last_part in us_states_abbr:
+                                state_province = us_states_abbr[second_last_part]
+                            elif second_last_part in us_states_full:
+                                state_province = us_states_full[second_last_part]
+                        elif last_part in {"china", "people's republic of china"}:
+                            country = "CN"
+                            state_province = second_last_part if second_last_part else "N/A"
+                        else:
+                            country = last_part.capitalize()
+                            state_province = second_last_part if second_last_part in us_states_abbr else "N/A"
+                    elif len(loc_parts) == 1:
+                        last_part = loc_parts[0]
+                        if last_part in us_states_full:
+                            state_province = us_states_full[last_part]
+                            country = "US"
+                        elif last_part in {"usa", "united states"}:
+                            country = "US"
+                        else:
+                            country = last_part.capitalize()
+               
+                # Build geographical_influence for co-authors (excluding target author)
+                if not is_target_author and full_name != "N/A" and full_name not in seen_authors and author_affiliations:
+                    seen_authors.add(full_name)
+                    affiliation = author_affiliations[0]
+                    cleaned_aff = clean_affiliation(affiliation)
+                    location = parse_location_from_affiliation(cleaned_aff)
+                    entry = {
+                        "name": full_name,
+                        "affiliation": cleaned_aff,
+                        "location": location
+                    }
+                    geographical_influence.append(json.dumps(entry))
+           
+        except requests.RequestException as e:
+            print(f"Request error for PubMed ID {pubmed_id}: {str(e)}")
+            continue
+        except ET.ParseError as e:
+            print(f"XML parsing error for PubMed ID {pubmed_id}: {str(e)}")
+            continue
+        except Exception as e:
+            print(f"Unexpected error for PubMed ID {pubmed_id}: {str(e)}")
+            continue
+   
+    return {
+        "research": research_list,
+        "collaborators": list(all_collaborators),
+        "primary_affiliation": primary_affiliation,
+        "geographical_influence": geographical_influence,
+        "country": country,
+        "state_province": state_province
+    }
+ 
+def fetch_pubmed_data(kol_name: str) -> Dict[str, any]:
+    """  
+    Args:
+        kol_name (str): Full name of KOL (First Middle Last or First Last)
+   
+    Returns:
+        dict: Processed research data with consistent primary affiliation
+    """
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+   
+    name_parts = kol_name.split()
+    if len(name_parts) < 2:
+        return {"research": [], "collaborators": [], "geographical_influence": [], "primary_affiliation": "N/A", "country": "N/A", "state_province": "N/A"}
+   
+    first_name = name_parts[0]
+    last_name = name_parts[-1]
+    middle_initial = name_parts[1][0] if len(name_parts) > 2 else ""
+   
+    # First try with full name as provided (e.g., "Pashtoon Murtaza Kasi [Author]")
+    full_name_search = f"{kol_name}[Author]"
+    search_params = {
+        "db": "pubmed",
+        "term": full_name_search,
+        "retmode": "json",
+        "retmax": 4
+    }
+   
+    try:
+        # First attempt with full name
+        response = requests.get(search_url, params=search_params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        pubmed_ids = data.get("esearchresult", {}).get("idlist", [])
+       
+        # If no IDs found, try naming convention (e.g., "Pashtoon M Kasi [Author]")
+        if not pubmed_ids and len(name_parts) >= 3:  # Only if there's a middle name to work with
+            formatted_name_search = f"{first_name} {middle_initial} {last_name}[Author]"
+            search_params["term"] = formatted_name_search
+            response = requests.get(search_url, params=search_params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            pubmed_ids = data.get("esearchresult", {}).get("idlist", [])
+       
+        if not pubmed_ids:
+            return {"research": [], "collaborators": [], "geographical_influence": [], "primary_affiliation": "N/A", "country": "N/A", "state_province": "N/A"}
+       
+        pubmed_data = fetch_pubmed_details(pubmed_ids, kol_name)
+       
+        if not pubmed_data["research"]:
+            return {"research": [], "collaborators": [], "geographical_influence": [], "primary_affiliation": "N/A", "country": "N/A", "state_province": "N/A"}
+       
+        return pubmed_data
+   
+    except requests.RequestException as e:
+        print(f"Request error in esearch: {str(e)}")
+        return {"research": [], "collaborators": [], "geographical_influence": [], "primary_affiliation": "N/A", "country": "N/A", "state_province": "N/A"}
+    except Exception as e:
+        print(f"Unexpected error in esearch: {str(e)}")
+        return {"research": [], "collaborators": [], "geographical_influence": [], "primary_affiliation": "N/A", "country": "N/A", "state_province": "N/A"}
+#HIPAASpace API
+token = "ECDD971AA3664D68B634406B9D963BE55D448FD7B298473B80D6ACDC7867B67E"
+ 
+# Function to fetch NPI ID and details by KOL name
+def space_API(kol_name):
+    start_time = time.time()  # Start the timer
+    kol_parts=kol_name.split()
+    first_name=kol_parts[0]
+    last_name=kol_parts[-1]
+    match_kol=f"{first_name} {last_name}"
+    # URL-encode the name for safer querying
+    endpoint = f"https://www.hipaaspace.com/api/npi/search?q={kol_name}&rt=json&token={token}"
+    print(f"Fetching: {endpoint}")
+ 
+    try:
+        response = requests.get(endpoint, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("NPI"):
+            limited_results = data["NPI"][:3]
+            for npi_record in limited_results:
+                # Build full name for matching
+                full_name = f"{npi_record.get('FirstName', '')} {npi_record.get('LastName', '')}"
+                if len(kol_parts)<3:
+                    full_name=f"{npi_record.get('FirstName', '')} {npi_record.get('MiddleName', '')}{npi_record.get('LastName', '')}"
+                if full_name.lower() == match_kol.lower():
+                    # Fields to extract
+                    fields = [
+                        "NPI", "LastName", "FirstName", "MiddleName", "Credential",
+                        "FirstLineMailingAddress", "MailingAddressCityName", "MailingAddressStateName",
+                        "MailingAddressPostalCode", "MailingAddressCountryCode", "PracticeLocationAddressTelephoneNumber",
+                        "FirstLinePracticeLocationAddress", "PracticeLocationAddressCityName",
+                        "PracticeLocationAddressStateName", "PracticeLocationAddressPostalCode",
+                        "PracticeLocationAddressCountryCode", "PracticeLocationAddressFaxNumber", "GenderCode", "Gender",
+                        "Taxonomy1", "PrimaryTaxonomy"
+                    ]
+ 
+                    parsed_data = {field: npi_record.get(field, "Not available") for field in fields}
+                    parsed_data["npi_id"] = int(npi_record.get("NPI", 0))  # Convert NPI to int if available
+ 
+                    elapsed_time = time.time() - start_time  # Calculate execution time
+                    print(f"Execution Time: {elapsed_time:.4f} seconds")
+ 
+                    return parsed_data
+ 
+        print(f"No matching NPI data found for {kol_name}")
+        return None
+ 
+    except requests.exceptions.RequestException as e:
+        print(f"Error searching for {kol_name}: {e}")
+        return None
+# Function to get structured metadata using ChatGPT
+def extract_kol_metadata(kol_name,prim_info):
+    prompt = f"""
+Your task is to extract and structure specific metadata fields about a KOL(of medical science)from the raw text: {kol_name} {prim_info} -md oncologist.
+Process it.
+Follow these steps:
+1. For missing fields like patient_advocacy,speaking_engagements, infer data from the combined text or search external sources (e.g., aacr.org, liverfoundation.org, novartis.com, accc-cancer.org)Must.
+2. then, analyze {{prim_info}} and get details from this institution site for relevant fields.'education' and 'qualifications' are arrays of strings (e.g., ['institution, degree, year']).
+3. fill each and every field must use your generative technique and provide proffessional summary(250-300 words).For contact details if valid than only fill otherwise "Not-available".
+4. Don't create nested dictionary in any fields.
+Expected JSON:
+{{
+  "primary_affiliation": "{prim_info}"(remove email if present),
+  "department": "string",
+  "title": "string(one word(eg like Associate Director,professor))",
+  "education": ["institution, degree, year"],
+  "qualifications": ["certification, year"],
+  "professional_summary": "200-350 word string",
+  "professional_history": ["array of string(Previous work history)"],
+  "areas_of_interest": ["array of string"],
+  "conferences_and_awards": ["array of string"],
+  "speaking_engagements": ["array of string"],
+  "patient_advocacy": ["array of string"],
+  "email": "string"
+}}
+"""
+    try:
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant generating structured JSON metadata."},
+                {"role": "user", "content": prompt}
+            ],
+            model="gpt-4o-mini",
+            temperature=1,
+            max_tokens=1000,
+            top_p=1
+        )
+        content = response.choices[0].message.content
+       
+        # Clean the response
+        json_str = content.replace('```json', '').replace('```', '').strip()
+        if not json_str:  # Check if the string is empty
+            print(f"Error: Empty response for {kol_name}")
+            return {"error": "Empty response from OpenAI"}
+       
+        # Attempt to parse JSON
+        parsed_json = json.loads(json_str)
+        return parsed_json
+   
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error for {kol_name}: {str(e)}")
+        print(f"Problematic content: {json_str}")
+        return {"error": f"Invalid JSON response: {str(e)}"}
+    except Exception as e:
+        print(f"Unexpected error for {kol_name}: {str(e)}")
+        return {"error": str(e)}
+def multi_model_kol_metadata(kol_name, prim_info,url):
+    # Step 1: Use gpt-4o-mini for lightweight extraction
+    mini_prompt = f"""
+    Extract and structure basic metadata from the raw text: NAME:{kol_name} primary-affiliation:{prim_info} -md, and {url}
+    Follow these steps:
+    1. Extract "primary_affiliation" from {prim_info} (remove email if present).
+    2. Set "department","state","country" as based on "Primary_affiliation" and "gender" based on name analysis.
+    3. Set "title" as (one word or two word(eg professor,director(if not found just put MD))).
+    4. Return only these fields in JSON and Don't create nested dictionary in any fields.
+ 
+    Expected JSON:
+    {{
+      "primary_affiliation": "string",
+      "department": "string",
+      "title": "string",
+      "gender":"string",
+      "state":"string",
+      "country":"string"
+    }}
+    """
+    try:
+        mini_response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a precise assistant for structured data extraction."},
+                {"role": "user", "content": mini_prompt}
+            ],
+            model="gpt-4o-mini",
+            temperature=0.7,
+            max_tokens=900,
+            top_p=1
+        )
+        mini_content = mini_response.choices[0].message.content
+        mini_json = json.loads(mini_content.replace('```json', '').replace('```', '').strip())
+    except Exception as e:
+        print(f"Error in gpt-4o-mini: {str(e)}")
+        mini_json = {"error": "Mini model failed"}
+ 
+    # Step 2: Use gpt-4o for complex inference and generation
+    full_prompt = f"""
+    Using the raw text: {kol_name}  -md {prim_info}, and {url}, complete the remaining metadata fields.
+    Follow these steps:
+    1. Infer and generate "education" and "qualifications" as arrays (e.g., ['institution, degree, year'], ['certification, year']) and "professional_history" (eg.'title,university,year') and if year is not available in education and qualification then no need to store or include "not available" or "year not specify".
+    2. Write a "professional_summary" (250-350 words) using generative techniques.
+    3. Fill "professional_history", "areas_of_interest", "conferences_and_awards", "speaking_engagements", "patient_advocacy" as arrays of strings (eg,'Topic of advocacy,year(if-available otherwise don't include year just)'), inferring from text or external sources (e.g., aacr.org, liverfoundation.org).
+    4. Set "email","phone","fax" to "Not-available" unless valid data is found.
+    5. Don't create nested dictionary in any fields and just return json format.
+ 
+    Expected JSON:
+    {{
+      "education": ["institution, degree, year"],
+      "qualifications": ["certification, year"],
+      "professional_summary": "250-350 word string",
+      "professional_history": ["array of string"],
+      "areas_of_interest": ["array of string"],
+      "conferences_and_awards": ["array of string"],
+      "speaking_engagements": ["array of string"],
+      "patient_advocacy": ["array of string"],
+      "phone":"string",
+      "fax":"string",
+      "email": "string"
+    }}
+    """
+    try:
+        full_response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a creative assistant for detailed metadata generation."},
+                {"role": "user", "content": full_prompt}
+            ],
+            model="gpt-4o",
+            temperature=1,
+            max_tokens=1500,
+            top_p=1
+        )
+        full_content = full_response.choices[0].message.content
+        full_json = json.loads(full_content.replace('```json', '').replace('```', '').strip())
+    except Exception as e:
+        print(f"Error in gpt-4o: {str(e)}")
+        full_json = {"error": "Full model failed"}
+ 
+    # Step 3: Merge results
+    try:
+        final_json = {**mini_json, **full_json}
+        return final_json
+    except Exception as e:
+        print(f"Error merging JSON: {str(e)}")
+        return {"error": "Failed to merge model outputs"}
+def process_kol(kol_name):
+    time.sleep(1)
+    kol_metadata_list = []
+    pubmed_data = fetch_pubmed_data(kol_name)
+    prim_info=pubmed_data["primary_affiliation"]
+    geo_info=pubmed_data["geographical_influence"]
+    url=fetch_kol_search_url(kol_name)
+    space = space_API(kol_name)
+    if space is None or pubmed_data["country"]!=space["PracticeLocationAddressCountryCode"]:
+        time.sleep(0.5)
+        metadata=multi_model_kol_metadata(kol_name, prim_info,url)
+        metadata["full_name"]=f"{kol_name}"
+        metadata["research"]=pubmed_data["research"]
+        metadata["Geographical_influence"]=geo_info
+        metadata["image_url"] = fetch_kol_images(kol_name)[kol_name]
+        metadata["time_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if store_kol_details(metadata):
+            kol_metadata_list.append(metadata)
+        return kol_metadata_list
+    metadata = extract_kol_metadata(kol_name,prim_info)
+    metadata["image_url"] = fetch_kol_images(kol_name)[kol_name]
+    middle = space.get("MiddleName", "Not available")
+    if middle == "Not available":
+        metadata["full_name"] = space["FirstName"] + " " + space["LastName"]
+    else:
+        metadata["full_name"] = space["FirstName"] + " " + middle + " " + space["LastName"]
+    metadata["state"] = space["PracticeLocationAddressStateName"]
+    metadata["country"] = space["PracticeLocationAddressCountryCode"]
+    metadata["gender"] = space["Gender"]
+    metadata["phone"] = space["PracticeLocationAddressTelephoneNumber"]
+    metadata["fax"] = space["PracticeLocationAddressFaxNumber"]
+    metadata["research"] = pubmed_data["research"]
+    
+    metadata["conferences_and_awards"] = get_conferences_and_awards(kol_name, url)
+
+    metadata["Geographical_influence"]=geo_info
+    metadata["npi_id"] = space.get("npi_id")
+    metadata["time_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if store_kol_details(metadata):
+        kol_metadata_list.append(metadata)
+    return kol_metadata_list
+
+
+def enrich_existing_kols():
+    query = {
+        "size": 1000,
+        "_source": ["full_name", "image_url"],
+        "query": {"match_all": {}}
+    }
+
+    response = opensearch.search(index="kol_details", body=query)
+    for hit in response['hits']['hits']:
+        doc_id = hit["_id"]
+        kol_name = hit["_source"]["full_name"]
+        url = fetch_kol_search_url(kol_name)
+        enriched = get_conferences_and_awards(kol_name, url)
+        try:
+            opensearch.update(index="kol_details", id=doc_id, body={"doc": {"conferences_and_awards": enriched}})
+            print(f"Updated {kol_name}")
+        except Exception as e:
+            print(f"Failed to update {kol_name}: {e}")
+
+
+def store_kol_details(kol_metadata):
+    """Store KOL details in OpenSearch."""
+    try:
+        opensearch.index(index="kol_details_staging", body=kol_metadata)
+        return True
+    except Exception as e:
+        print(f"Error storing KOL details: {str(e)}")
+        return False
+
+def get_conferences_and_awards(kol_name, url):
+    prompt = f"""
+    Your task is to find major conferences and awards associated with this medical professional:
+    Name: {kol_name}
+    Link: {url}
+
+    Use credible sources like OncLive, aacr.org, etc. Mention conference names, article/page title, date (if available), and a valid source URL.
+
+    Output format: An array of strings like:
+    [
+        "Title, Date (if available), Source URL"
+    ]
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a medical metadata enrichment expert."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        raw_text = response.choices[0].message.content
+        clean_json = raw_text.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        print(f"Error getting conferences for {kol_name}: {e}")
+        return []
+
+
+
+def fetch_authors_from_opensearch():
+    """Fetch top authors from OpenSearch article_index."""
+    query = {
+        "size": 0,
+        "query": {
+            "term": {
+                "article_category": "NF AND Advocacy Groups"
+            }
+        },
+        "aggs": {
+            "top_authors": {
+                "terms": {
+                    "script": {
+                        "source": "params['_source']['authors']",
+                        "lang": "painless"
+                    },
+                    "size": 15,
+                    "order": {"_count": "desc"}
+                }
+            }
+        }
+    }
+   
+    try:
+        response = opensearch.search(index="articles_index", body=query)
+        buckets = response["aggregations"]["top_authors"]["buckets"]
+        authors_list = [bucket["key"] for bucket in buckets]
+        print(f"Fetched {len(authors_list)} authors from OpenSearch: {authors_list}")
+        return authors_list
+    except Exception as e:
+        print(f"Error fetching authors from OpenSearch: {str(e)}")
+        return []
+# Lambda Handler
+def lambda_handler(event, context):
+    # Fetch authors dynamically from OpenSearch
+    authors_list = fetch_authors_from_opensearch()
+    if not authors_list:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": "Failed to fetch authors from OpenSearch"})
+        }
+   
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = []
+        for future in executor.map(process_kol, authors_list):
+            results.extend(future)
+            time.sleep(0.5)
+    return {
+        "statusCode": 200,
+        "body": json.dumps(results, indent=2)
+    }
+#local test
+if __name__ == "__main__":
+    event = {}
+    context = {}
+    result = lambda_handler(event, context)
+    print(result)
